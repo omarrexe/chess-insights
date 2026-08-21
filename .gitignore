@@ -1,0 +1,19 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Data (raw game files — too large for git)
+data/raw/
+data/analyzed/
+data/reports/
+
+# Node
+dashboard/node_modules/
+dashboard/.next/
+
+# OS
+.DS_Store
+Thumbs.db
