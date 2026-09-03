@@ -7,9 +7,9 @@
 ## The Idea
 
 Chess.com already shows you what happened in each game.  
-This project shows you **why you keep losing** — as a pattern across all your games.
+This project shows you **why you keep losing** — as a pattern across your games.
 
-No Stockfish. No centipawn scores. No charts for the sake of charts.  
+No Stockfish. No centipawn scores. No noisy dashboards.  
 Just three questions answered with your real data:
 
 ---
@@ -19,40 +19,69 @@ Just three questions answered with your real data:
 ### 📌 One Fix This Week
 Every week, exactly **one** actionable thing to work on.
 
-> *"You win 68% of your first 3 games per session, then drop to 41% after. Stop at 3 games."*
+> *"You score 66% in your first 3 games per session, then drop to 44% after. Cap sessions at 3."*
 
-Not 10 tips. Not a report. One thing. Change it. Come back next week.
+Not 10 tips. Not a generic report. One thing. Fix it. Re-check next week.
 
 ---
 
 ### 🕐 Best Time to Play
 When are you actually sharp?
 
-> *"You win 61% of games between 20:00–23:00. You win 31% on weekend afternoons."*
+> *"Your best window is 8 PM–11 PM with a 62% score over 48 games."*
 
-Knowing when NOT to play is as valuable as knowing how to play.
+You also see weak windows, day-of-week trends, fatigue after game 3, and tilt after 2 straight losses.
 
 ---
 
 ### 🧬 Your Losing Recipe
-The specific combination of factors that predict your losses.
+The specific combinations that predict your losses.
 
-> *"When you play the Sicilian as Black and the game goes past move 35, you lose 78% of the time."*
+> *"When playing Black in long games (35+ moves), your loss rate jumps far above baseline."*
 
-This is personal to **you** — not generic advice.
+Includes **how losses happen** (checkmate / timeout / resignation) and **actual vs Elo-expected score**.
 
 ---
 
 ## Why No Engine?
 
-All three features use only **game metadata** from Chess.com's free API:
-- Timestamps, results, colors, openings, move counts, ratings
+All features use only **game metadata** from Chess.com's free API:
+- timestamps
+- results
+- colors
+- openings (ECO / ECOUrl)
+- move counts from PGN movetext
+- ratings
 
 That means:
-- Runs in **seconds** (not hours)
-- No CPU cost
-- Updates automatically with every new game
+- Runs quickly
+- No engine cost
+- Automatically updates with new games
 - 100% free
+
+---
+
+## Accuracy Improvements in v2
+
+- ✅ Timezone-safe timestamps (`st.context.timezone` + manual fallback)
+- ✅ Correct draw handling (symmetric: neither side has `win`)
+- ✅ Better move counting from PGN movetext (plies → full moves)
+- ✅ Filters out variants and auto-aborted 0-move games
+- ✅ Score-based metrics everywhere (Win=1, Draw=0.5, Loss=0)
+- ✅ Session logic based on inactivity gap (45 minutes), not calendar day
+- ✅ Elo expected-score comparison instead of naive "stronger opponent" heuristics
+- ✅ Retry/backoff and basic rate-limit handling for fetch reliability
+
+---
+
+## New UX / Analysis Features
+
+- Time class includes `daily`
+- Analysis depth selector (3 / 6 / 12 / 24 months / all time)
+- Rated-only filter
+- Rating progression chart with 20-game trend line
+- Wilson lower-bound ranking for best/worst time windows
+- Methodology explainer in-app
 
 ---
 
@@ -61,39 +90,38 @@ That means:
 | Layer | Tech |
 |-------|------|
 | Data | Chess.com public API |
-| Backend | Python + FastAPI |
-| Frontend | Next.js 15 |
+| App | Streamlit |
+| Language | Python |
+| DataFrame / charts | pandas |
 | Engine | ❌ None needed |
 
 ---
 
-## Quick Start
+## Quick Start (Streamlit)
 
 ```bash
-# Install Python deps
-pip install -r requirements.txt
+# Install dependencies
+pip install -r requirements_streamlit.txt
 
-# Install dashboard deps
-cd dashboard && npm install && cd ..
-
-# Start the API
-python -m pipeline.api
-
-# Start the dashboard (new terminal)
-cd dashboard && npm run dev
+# Run app
+streamlit run streamlit_app.py
 ```
 
-Open **http://localhost:3000**
+Open the local URL shown by Streamlit (typically `http://localhost:8501`).
 
 ---
 
-## Player: omarrrexe
+## Notes
 
-| Time Control | Games | Win Rate |
-|---|---|---|
-| Rapid | ~916 | ~50% |
-| Blitz | ~510 | ~49% |
+- On some local Windows environments, install timezone database support:
+
+```bash
+pip install tzdata
+```
+
+- Data is fetched from Chess.com public endpoints and cached for 1 hour.
+- No personal data is stored by this app.
 
 ---
 
-*Built by [Omar](https://www.chess.com/member/omarrrexe) — turning 1,448 games into 3 useful insights.*
+*Built by [Omar](https://www.chess.com/member/omarrrexe) — turning game history into practical, weekly improvement signals.*
