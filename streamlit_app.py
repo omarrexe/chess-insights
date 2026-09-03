@@ -1,14 +1,20 @@
 """
 Chess Insights — Streamlit App
 3 purely metadata-based analyses. No engine. No noise.
+
+v2 — accuracy + usefulness pass
 """
 
-import streamlit as st
-import requests
-import json
+import math
 import re
+import time as time_mod
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+import requests
+import streamlit as st
 
 # ─── Page config ─────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -18,298 +24,451 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# ─── Minimal custom CSS ───────────────────────────────────────────────────────
 st.markdown("""
 <style>
     .block-container { padding-top: 2rem; max-width: 800px; }
-    .metric-row { display: flex; gap: 1rem; margin-bottom: 1.5rem; }
     .insight-box {
-        background: #1a1a2a;
-        border-left: 4px solid #7c6eff;
-        border-radius: 8px;
-        padding: 0.85rem 1rem;
-        margin-bottom: 0.6rem;
-        font-size: 0.95rem;
+        background: #1a1a2a; border-left: 4px solid #7c6eff;
+        border-radius: 8px; padding: 0.85rem 1rem; margin-bottom: 0.6rem; font-size: 0.95rem;
     }
     .insight-box.bad  { border-left-color: #ff5e5e; background: #1f1212; }
     .insight-box.good { border-left-color: #4fffb0; background: #111f18; }
     .fix-box {
         background: linear-gradient(135deg, #141422, #1a1a2e);
-        border: 1px solid #7c6eff;
-        border-radius: 12px;
-        padding: 1.5rem;
-        margin-bottom: 1rem;
+        border: 1px solid #7c6eff; border-radius: 12px; padding: 1.5rem; margin-bottom: 1rem;
     }
     .action-box {
-        background: #1c1c28;
-        border-left: 4px solid #4fffb0;
-        border-radius: 6px;
-        padding: 0.75rem 1rem;
-        margin-top: 0.75rem;
+        background: #1c1c28; border-left: 4px solid #4fffb0;
+        border-radius: 6px; padding: 0.75rem 1rem; margin-top: 0.75rem;
     }
 </style>
 """, unsafe_allow_html=True)
 
+# ─── Constants ───────────────────────────────────────────────────────────────
 HEADERS = {"User-Agent": "Chess Insights App (github.com/omarrrexe)"}
 
-# ─── Chess.com fetcher ────────────────────────────────────────────────────────
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_all_games(username: str) -> list[dict]:
-    """Fetch all games for a Chess.com username. Cached for 1 hour."""
-    url = f"https://api.chess.com/pub/player/{username}/games/archives"
-    resp = requests.get(url, headers=HEADERS, timeout=10)
-    if resp.status_code != 200:
-        return []
-    archives = resp.json().get("archives", [])
-    all_games = []
-    progress = st.progress(0, text="Fetching games from Chess.com…")
-    for i, archive_url in enumerate(archives):
+SESSION_GAP_SECONDS = 45 * 60          # gap that separates two sessions
+MIN_PLIES = 1                          # skip 0-move (auto-aborted) games
+
+LOSS_RESULTS = {"checkmated", "resigned", "timeout", "abandoned", "lose", "ruleviolation"}
+LOSS_TYPE = {
+    "checkmated": "Checkmated",
+    "resigned":   "Resigned",
+    "timeout":    "Out of time",
+    "abandoned":  "Abandoned / quit",
+}
+
+# Robust SAN matcher (piece moves, pawn moves incl. promotion, castling)
+SAN_RE = re.compile(
+    r'(?:[NBRQK][a-h1-8]{0,2}x?[a-h][1-8]'
+    r'|[a-h](?:[a-h])?x?[a-h]?[1-8](?:=[NBRQ])?'
+    r'|O-O(?:-O)?)[+#]?'
+)
+
+DEPTH_OPTIONS = {"Past 3 months": 3, "Past 6 months": 6, "Past 12 months": 12,
+                 "Past 24 months": 24, "All time": 0}
+
+TIMEZONES = [
+    "UTC", "US/Eastern", "US/Central", "US/Mountain", "US/Pacific",
+    "America/Mexico_City", "America/Bogota", "America/Lima",
+    "America/Sao_Paulo", "America/Argentina/Buenos_Aires",
+    "Europe/London", "Europe/Madrid", "Europe/Paris", "Europe/Berlin",
+    "Europe/Warsaw", "Europe/Istanbul", "Europe/Moscow",
+    "Africa/Cairo", "Africa/Johannesburg",
+    "Asia/Dubai", "Asia/Karachi", "Asia/Kolkata", "Asia/Dhaka",
+    "Asia/Jakarta", "Asia/Singapore", "Asia/Manila", "Asia/Shanghai",
+    "Asia/Tokyo", "Australia/Sydney", "Pacific/Auckland",
+]
+
+# ─── Small helpers ───────────────────────────────────────────────────────────
+def get_tz(name: str):
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        return timezone.utc
+
+def fmt_h(h: int) -> str:
+    h %= 24
+    if h == 0:  return "12 AM"
+    if h < 12:  return f"{h} AM"
+    if h == 12: return "12 PM"
+    return f"{h-12} PM"
+
+def block_label(h: int) -> str:
+    return f"{fmt_h(h)} – {fmt_h((h+3) % 24)}"
+
+def pts(g: dict) -> float:
+    """Score: win = 1, draw = ½, loss = 0."""
+    return 1.0 if g["won"] else (0.5 if g["drew"] else 0.0)
+
+def prate(gs: list) -> float:
+    return sum(pts(g) for g in gs) / len(gs) if gs else 0.0
+
+def wilson_lo(p: float, n: int, z: float = 1.96) -> float:
+    """Wilson lower bound — ranks rates without trusting tiny samples."""
+    if n == 0: return 0.0
+    denom  = 1 + z*z/n
+    centre = p + z*z/(2*n)
+    adj    = z * math.sqrt((p*(1-p) + z*z/(4*n)) / n)
+    return max(0.0, (centre - adj) / denom)
+
+def expected_score(p_rating: int, o_rating: int) -> float:
+    """Elo expected score against a given opponent."""
+    if not p_rating or not o_rating: return 0.5
+    return 1 / (1 + 10 ** ((o_rating - p_rating) / 400))
+
+def count_plies(pgn: str) -> int:
+    """Accurately count half-moves from PGN movetext."""
+    if not pgn: return 0
+    body = pgn.split("\n\n", 1)
+    mt = body[1] if len(body) == 2 else body[0]
+    mt = re.sub(r"\{[^}]*\}", " ", mt)   # {comments}
+    mt = re.sub(r";[^\n]*",    " ", mt)  # line comments
+    mt = re.sub(r"\$\d+",      " ", mt)  # NAGs
+    mt = re.sub(r"\b\d+\.*",   " ", mt)  # move numbers (incl. 12...)
+    return len(SAN_RE.findall(mt))
+
+def month_key(url: str):
+    m = re.search(r"/(\d{4})/(\d{1,2})$", url)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+def http_json(url: str, retries: int = 3):
+    """GET with retry/backoff. Returns (data, status)."""
+    for attempt in range(retries):
         try:
-            r = requests.get(archive_url, headers=HEADERS, timeout=10)
+            r = requests.get(url, headers=HEADERS, timeout=15)
             if r.status_code == 200:
-                all_games.extend(r.json().get("games", []))
-        except Exception:
-            pass
-        progress.progress((i + 1) / len(archives), text=f"Fetching… {i+1}/{len(archives)} months")
+                return r.json(), 200
+            if r.status_code == 429:               # rate limited
+                time_mod.sleep(1.5 * (attempt + 1))
+                continue
+            return None, r.status_code
+        except (requests.RequestException, ValueError):
+            time_mod.sleep(0.5 * (attempt + 1))
+    return None, 0
+
+def clean_username(raw: str) -> str:
+    s = raw.strip()
+    if "chess.com/" in s.lower():                 # accept pasted profile URLs
+        s = s.rstrip("/").split("/")[-1]
+    s = s.lstrip("@").strip().lower()
+    return s if re.fullmatch(r"[a-z0-9_-]{3,25}", s) else ""
+
+# ─── Chess.com fetchers ──────────────────────────────────────────────────────
+@st.cache_data(ttl=3600, show_spinner=False)
+def check_player(username: str) -> int:
+    _, status = http_json(f"https://api.chess.com/pub/player/{username}")
+    return status
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_all_games(username: str, months: int) -> list[dict]:
+    """Fetch games for the last `months` months (0 = all). Cached 1 hour."""
+    data, status = http_json(f"https://api.chess.com/pub/player/{username}/games/archives")
+    if status != 200 or not data:
+        return []
+    urls = data.get("archives") or []
+
+    if months > 0:  # only fetch archive months inside the window
+        now = datetime.now(timezone.utc)
+        idx = now.year * 12 + (now.month - 1) - months
+        cy, cm = divmod(idx, 12)
+        cutoff = (cy, cm + 1)
+        urls = [u for u in urls if (month_key(u) or cutoff) >= cutoff]
+
+    if not urls:
+        return []
+
+    all_games = []
+    progress = st.progress(0.0, text="Fetching games from Chess.com…")
+    for i, url in enumerate(urls):
+        data, status = http_json(url)
+        if status == 200 and data:
+            all_games.extend(data.get("games") or [])
+        progress.progress((i + 1) / len(urls),
+                          text=f"Fetching… {i+1}/{len(urls)} months")
+        time_mod.sleep(0.05)  # be polite to the API
     progress.empty()
     return all_games
 
-
-# ─── Parse a single game ─────────────────────────────────────────────────────
-def parse_game(game: dict, username: str) -> dict | None:
-    white = game.get("white", {})
-    black = game.get("black", {})
+# ─── Parse a single game ──────────────────────────────────────────────────────
+def parse_game(game: dict, username: str, tz) -> dict | None:
+    white, black = game.get("white", {}), game.get("black", {})
     wname = white.get("username", "").lower()
     bname = black.get("username", "").lower()
-    u = username.lower()
 
-    if wname == u:
-        color = "white"
-        result_str = white.get("result", "")
-        player_rating = white.get("rating", 0)
-        opp_rating = black.get("rating", 0)
-        accuracy = game.get("accuracies", {}).get("white")
-    elif bname == u:
-        color = "black"
-        result_str = black.get("result", "")
-        player_rating = black.get("rating", 0)
-        opp_rating = white.get("rating", 0)
-        accuracy = game.get("accuracies", {}).get("black")
+    if wname == username:
+        color, me, opp = "white", white, black
+    elif bname == username:
+        color, me, opp = "black", black, white
     else:
         return None
 
-    won  = result_str == "win"
-    drew = result_str in ("agreed", "stalemate", "repetition", "insufficient", "50move", "timevsinsufficient")
-    lost = not won and not drew
+    result_str = me.get("result", "") or ""
+    opp_result = opp.get("result", "") or ""
+    won   = result_str == "win"
+    lost_ = (opp_result == "win") or (result_str in LOSS_RESULTS)
+    drew  = not won and not lost_
 
-    end_ts = game.get("end_time", 0)
-    dt = datetime.fromtimestamp(end_ts) if end_ts else None
-    pgn = game.get("pgn", "")
-    move_count = len(re.findall(r"\d+\.\s+\S+", pgn))
+    pgn = game.get("pgn", "") or ""
+    plies = count_plies(pgn)
+    if plies < MIN_PLIES:            # auto-aborted game → not real data
+        return None
 
+    end_ts = game.get("end_time") or 0
+    dt = datetime.fromtimestamp(end_ts, tz) if end_ts else None
+
+    eco_m = re.search(r'\[ECO "([A-E]\d{2})"\]', pgn)
+    eco = eco_m.group(1) if eco_m else ""
     eco_url_m = re.search(r'\[ECOUrl "([^"]+)"\]', pgn)
     opening = (eco_url_m.group(1).split("/")[-1].replace("-", " ").title()
-               if eco_url_m else "Unknown")
+               if eco_url_m else (eco or "Unknown"))
+
+    acc = game.get("accuracies", {}).get(color)
+    try:
+        acc = float(acc) if acc is not None else None
+    except (TypeError, ValueError):
+        acc = None
 
     return {
         "end_time": end_ts, "dt": dt, "color": color,
-        "won": won, "drew": drew, "lost": lost, "result": result_str,
-        "player_rating": player_rating, "opp_rating": opp_rating,
+        "won": won, "drew": drew, "lost": lost_, "result": result_str,
+        "loss_type": LOSS_TYPE.get(result_str, "Other") if lost_ else None,
+        "player_rating": me.get("rating", 0) or 0,
+        "opp_rating": opp.get("rating", 0) or 0,
         "time_class": game.get("time_class", ""),
-        "move_count": move_count, "opening": opening, "accuracy": accuracy,
+        "rules": game.get("rules", "chess"),
+        "rated": game.get("rated", True),
+        "plies": plies, "moves": (plies + 1) // 2,   # fullmoves
+        "opening": opening, "eco": eco, "accuracy": acc,
     }
 
+def tag_sessions(games: list[dict]):
+    """Mark session id, index within session, and prior consecutive losses."""
+    prev_t, sid, sidx, streak = None, 0, 0, 0
+    for g in games:
+        t = g["end_time"]
+        if prev_t is None or t - prev_t > SESSION_GAP_SECONDS:
+            sid += 1; sidx = 1; streak = 0
+        g["sidx"] = sidx
+        g["prior_loss_streak"] = streak
+        streak = streak + 1 if g["lost"] else 0
+        sidx += 1; prev_t = t
 
-def get_games(raw: list, username: str, time_class: str) -> list[dict]:
-    games = [p for g in raw if (p := parse_game(g, username)) and p["time_class"] == time_class]
+def get_games(raw: list, username: str, time_class: str,
+              tz_label: str, rated_only: bool) -> list[dict]:
+    tz = get_tz(tz_label)
+    games = []
+    for g in raw:
+        p = parse_game(g, username, tz)
+        if not p: continue
+        if p["time_class"] != time_class:  continue
+        if p["rules"] != "chess":          continue   # exclude variants
+        if rated_only and not p["rated"]: continue
+        games.append(p)
     games.sort(key=lambda g: g["end_time"])
+    tag_sessions(games)
     return games
-
 
 # ─── Analysis 1: One Fix This Week ───────────────────────────────────────────
 def one_fix(games: list[dict]) -> dict:
-    import time as _time
-    now_ts = _time.time()
-    week_ago = now_ts - 7 * 86400
-    recent = [g for g in games if g["end_time"] >= week_ago]
-    if len(recent) < 5:
-        recent = games[-20:]
-        window_label = "last 20 games"
+    if not games: return {}
+    now = time_mod.time()
+    recent = [g for g in games if g["end_time"] >= now - 7 * 86400]
+    if len(recent) >= 5:
+        window = "last 7 days"
     else:
-        window_label = "last 7 days"
-    if not recent:
-        return {}
+        recent, window = games[-20:], "last 20 games"
+    if not recent: return {}
 
-    total = len(recent)
-    wins  = sum(1 for g in recent if g["won"])
+    total  = len(recent)
+    wins   = sum(1 for g in recent if g["won"])
     losses = sum(1 for g in recent if g["lost"])
-    draws = total - wins - losses
-    win_rate = wins / total if total else 0
+    draws  = total - wins - losses
+    score  = (wins + 0.5 * draws) / total if total else 0
 
     candidates = []
-    day_groups = defaultdict(list)
-    for g in recent:
-        if g["dt"]:
-            day_groups[g["dt"].strftime("%Y-%m-%d")].append(g)
 
-    early_wins = early_n = late_wins = late_n = 0
-    for day_games in day_groups.values():
-        day_games.sort(key=lambda g: g["end_time"])
-        for idx, g in enumerate(day_games):
-            if idx < 3:
-                early_n += 1; early_wins += int(g["won"])
-            else:
-                late_n += 1; late_wins += int(g["won"])
-
-    if early_n >= 5 and late_n >= 3:
-        ewr = early_wins / early_n; lwr = late_wins / late_n
-        if ewr - lwr > 0.15:
+    # 1) Fatigue: games 1–3 vs 4+ of a session
+    early = [g for g in recent if g["sidx"] <= 3]
+    late  = [g for g in recent if g["sidx"] >= 4]
+    if len(early) >= 8 and len(late) >= 5:
+        er, lr = prate(early), prate(late)
+        if er - lr >= 0.12:
             candidates.append({
-                "priority": (ewr - lwr) * 100,
-                "fix": "Stop after 3 games per session",
-                "reason": f"Your win rate is {ewr*100:.0f}% for your first 3 games, then drops to {lwr*100:.0f}% after. Fatigue is costing you real points.",
-                "action": "Set a hard limit: maximum 3 games per sitting. Walk away after. Come back fresh tomorrow.",
+                "priority": (er - lr) * 100,
+                "fix": "Cap sessions at 3 games",
+                "reason": f"You score {er*100:.0f}% in games 1–3 of a session, but only "
+                          f"{lr*100:.0f}% from game 4 onward ({len(late)} games). Fatigue is costing real points.",
+                "action": "Hard limit: 3 games per sitting. Stand up, walk away, come back tomorrow fresh.",
                 "icon": "🛑",
             })
 
-    white_g = [g for g in recent if g["color"] == "white"]
-    black_g = [g for g in recent if g["color"] == "black"]
-    if len(white_g) >= 5 and len(black_g) >= 5:
-        wwr = sum(1 for g in white_g if g["won"]) / len(white_g)
-        bwr = sum(1 for g in black_g if g["won"]) / len(black_g)
-        gap = abs(wwr - bwr)
-        if gap > 0.2:
-            weak = "Black" if bwr < wwr else "White"
-            strong_rate = max(wwr, bwr) * 100; weak_rate = min(wwr, bwr) * 100
+    # 2) Tilt: playing on after 2 straight losses
+    tilted = [g for g in recent if g["prior_loss_streak"] >= 2]
+    fresh  = [g for g in recent if g["prior_loss_streak"] == 0]
+    if len(tilted) >= 5 and len(fresh) >= 8:
+        tr, fr = prate(tilted), prate(fresh)
+        if fr - tr >= 0.15:
+            candidates.append({
+                "priority": (fr - tr) * 90,
+                "fix": "Stop after 2 straight losses",
+                "reason": f"Right after two losses in a row you score only {tr*100:.0f}% "
+                          f"vs {fr*100:.0f}% otherwise. Classic tilt.",
+                "action": "Rule: 2 losses in a row → session over. Review one loss instead of re-queuing.",
+                "icon": "🧊",
+            })
+
+    # 3) Color gap
+    wg = [g for g in recent if g["color"] == "white"]
+    bg = [g for g in recent if g["color"] == "black"]
+    if len(wg) >= 6 and len(bg) >= 6:
+        wr, br = prate(wg), prate(bg)
+        gap = abs(wr - br)
+        if gap >= 0.18:
+            weak = "Black" if br < wr else "White"
             candidates.append({
                 "priority": gap * 80,
-                "fix": f"Study your {weak} openings",
-                "reason": f"You win {strong_rate:.0f}% as {'White' if weak == 'Black' else 'Black'} but only {weak_rate:.0f}% as {weak}. A {gap*100:.0f}% gap.",
-                "action": f"Pick ONE {weak} opening and learn it properly. Just one. Consistency beats variety at your level.",
+                "fix": f"Fix your {weak} openings",
+                "reason": f"You score {max(wr,br)*100:.0f}% as {'White' if weak == 'Black' else 'Black'} "
+                          f"but only {min(wr,br)*100:.0f}% as {weak} — a {gap*100:.0f}-point gap.",
+                "action": f"Pick ONE {weak} opening system and play it exclusively for 30 games. Depth beats variety.",
                 "icon": "♟️",
             })
 
-    long_g = [g for g in recent if g["move_count"] >= 35]
-    if len(long_g) >= 4:
-        ll_rate = sum(1 for g in long_g if g["lost"]) / len(long_g)
-        short_g = [g for g in recent if g["move_count"] < 25]
-        sl_rate = sum(1 for g in short_g if g["lost"]) / len(short_g) if short_g else 0
-        if ll_rate > 0.55 and ll_rate > sl_rate + 0.2:
+    # 4) Long-game conversion
+    long_g = [g for g in recent if g["moves"] >= 35]
+    if len(long_g) >= 8:
+        lp = prate(long_g)
+        short_g = [g for g in recent if g["moves"] <= 12]
+        if lp < 0.45 and (not short_g or prate(short_g) - lp >= 0.15):
             candidates.append({
-                "priority": (ll_rate - sl_rate) * 70,
+                "priority": (0.5 - lp) * 100,
                 "fix": "Practice basic endgames",
-                "reason": f"You lose {ll_rate*100:.0f}% of long games. You're reaching good positions but can't convert them.",
-                "action": "Solve 5 basic king+pawn endgame puzzles today. 10 minutes. Fixes the most common conversion failure.",
+                "reason": f"In games reaching 35+ moves you score only {lp*100:.0f}% "
+                          f"({len(long_g)} games) — you get there but can't convert.",
+                "action": "10 minutes of king+pawn endgames today (Lucena, Philidor, square rule). Highest-ROI study at your level.",
                 "icon": "📚",
             })
 
+    # 5) Loss type — clock vs checkmate
+    ltypes = [g["loss_type"] for g in recent if g["lost"]]
+    if len(ltypes) >= 5:
+        t_share = ltypes.count("Out of time") / len(ltypes)
+        m_share = ltypes.count("Checkmated")  / len(ltypes)
+        if t_share >= 0.30:
+            candidates.append({
+                "priority": t_share * 60,
+                "fix": "Fix your clock management",
+                "reason": f"{ltypes.count('Out of time')} of your last {len(ltypes)} losses "
+                          f"({t_share*100:.0f}%) were on time. The position doesn't matter if the flag falls.",
+                "action": "Play one time-control slower (blitz→rapid) for two weeks. Use the extra time to check for hanging pieces.",
+                "icon": "⏱️",
+            })
+        elif m_share >= 0.45:
+            candidates.append({
+                "priority": m_share * 55,
+                "fix": "Blunder-check before every move",
+                "reason": f"{ltypes.count('Checkmated')} of your last {len(ltypes)} losses "
+                          f"({m_share*100:.0f}%) ended in checkmate — tactical oversights under pressure.",
+                "action": "Before each move, one question: 'What did my opponent's last move threaten?' Kills most club-level mates.",
+                "icon": "⏸️",
+            })
+
+    # 6) Accuracy gap (when Chess.com provides it)
     acc_g = [g for g in recent if g["accuracy"] is not None]
-    if len(acc_g) >= 5:
-        win_acc  = [g["accuracy"] for g in acc_g if g["won"]]
-        loss_acc = [g["accuracy"] for g in acc_g if g["lost"]]
-        if win_acc and loss_acc:
-            avg_w = sum(win_acc) / len(win_acc)
-            avg_l = sum(loss_acc) / len(loss_acc)
-            if avg_w - avg_l > 10 and avg_l < 75:
+    if len(acc_g) >= 6:
+        wacc = [g["accuracy"] for g in acc_g if g["won"]]
+        lacc = [g["accuracy"] for g in acc_g if g["lost"]]
+        if wacc and lacc:
+            aw, al = sum(wacc)/len(wacc), sum(lacc)/len(lacc)
+            if aw - al > 8 and al < 75:
                 candidates.append({
-                    "priority": (avg_w - avg_l) * 0.6,
-                    "fix": "Slow down — take 5 more seconds per move",
-                    "reason": f"Your accuracy is {avg_w:.0f}% when you win but {avg_l:.0f}% when you lose. The gap is all about rushing.",
-                    "action": "Before every move: 'Is any piece of mine hanging? Can they take anything for free?' One habit = 50 rating points.",
-                    "icon": "⏸️",
+                    "priority": (aw - al) * 0.8,
+                    "fix": "Slow down — 5 extra seconds per move",
+                    "reason": f"Winning games: {aw:.0f}% accuracy. Losing games: {al:.0f}%. The gap is rushing, not knowledge.",
+                    "action": "Before moving: 'Is anything of mine hanging? Is anything of theirs?' One habit, real rating points.",
+                    "icon": "🐢",
                 })
 
     if not candidates:
         candidates.append({
             "priority": 10,
-            "fix": "Keep playing — no major leak detected",
-            "reason": f"You won {wins}/{total} games ({win_rate*100:.0f}%) this week. Solid performance.",
-            "action": "Review one loss per session by replaying moves — no engine needed. Just ask 'where did it go wrong?'",
+            "fix": "Keep it up — no big leak detected",
+            "reason": f"{wins}W / {draws}D / {losses}L in your {window} ({score*100:.0f}% score). Nothing broken enough to prioritize.",
+            "action": "Review one loss per session without an engine — find the move where it went wrong, describe it in one sentence.",
             "icon": "✅",
         })
 
     best = max(candidates, key=lambda c: c["priority"])
+    others = [c["fix"] for c in sorted(candidates, key=lambda c: -c["priority"])
+              if c is not best and c["fix"] != best["fix"]]
     return {
-        "window": window_label, "total": total, "wins": wins,
-        "losses": losses, "draws": draws, "win_rate": round(win_rate * 100, 1),
-        **best, "others": [c["fix"] for c in sorted(candidates, key=lambda c: -c["priority"]) if c["fix"] != best["fix"]],
+        "window": window, "total": total, "wins": wins,
+        "losses": losses, "draws": draws, "score": round(score * 100, 1),
+        **best, "others": others,
     }
-
 
 # ─── Analysis 2: Best Time to Play ───────────────────────────────────────────
 def best_time(games: list[dict]) -> dict:
-    hour_data = defaultdict(lambda: {"games": 0, "wins": 0})
-    day_data  = defaultdict(lambda: {"games": 0, "wins": 0})
-    seq_data  = defaultdict(lambda: {"games": 0, "wins": 0})
-
-    day_groups = defaultdict(list)
-    for g in games:
-        if g["dt"]:
-            day_groups[g["dt"].strftime("%Y-%m-%d")].append(g)
-    for day_games in day_groups.values():
-        day_games.sort(key=lambda g: g["end_time"])
-        for idx, g in enumerate(day_games):
-            g["_seq"] = min(idx + 1, 6)
-
-    DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    blocks = defaultdict(lambda: [0, 0.0])
+    days   = defaultdict(lambda: [0, 0.0])
+    seqs   = defaultdict(lambda: [0, 0.0])
 
     for g in games:
         if not g["dt"]: continue
-        h   = g["dt"].hour
-        dow = g["dt"].weekday()
-        seq = g.get("_seq", 1)
-        hour_data[h]["games"] += 1
-        day_data[dow]["games"] += 1
-        seq_data[seq]["games"] += 1
-        if g["won"]:
-            hour_data[h]["wins"] += 1
-            day_data[dow]["wins"] += 1
-            seq_data[seq]["wins"] += 1
+        p = pts(g)
+        blocks[(g["dt"].hour // 3) * 3][0] += 1; blocks[(g["dt"].hour // 3) * 3][1] += p
+        days[g["dt"].weekday()][0] += 1;         days[g["dt"].weekday()][1] += p
+        s = min(g["sidx"], 5)
+        seqs[s][0] += 1;                          seqs[s][1] += p
 
-    def to_rate(d):
-        return [(k, v["games"], round(v["wins"]/v["games"]*100, 1) if v["games"] else 0)
-                for k, v in sorted(d.items())]
+    DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
-    def fmt_h(h):
-        if h == 0: return "12 AM"
-        if h < 12: return f"{h} AM"
-        if h == 12: return "12 PM"
-        return f"{h-12} PM"
+    block_rows = [(block_label(k), n, round(p / n * 100, 1))
+                  for k, (n, p) in sorted(blocks.items()) if n >= 3]
+    day_rows   = [(DAY_NAMES[k], n, round(p / n * 100, 1))
+                  for k, (n, p) in sorted(days.items())]
+    seq_rows   = [({1: "#1", 2: "#2", 3: "#3", 4: "#4"}.get(k, "5+"), n, round(p / n * 100, 1))
+                  for k, (n, p) in sorted(seqs.items())]
 
-    hour_rows = [(fmt_h(k), g, wr) for k, g, wr in to_rate(hour_data) if g >= 3]
-    day_rows  = [(DAY_NAMES[k], g, wr) for k, g, wr in to_rate(day_data)]
-    seq_rows  = [(f"#{k}" if k < 6 else "6+", g, wr) for k, g, wr in to_rate(seq_data)]
-
-    # Insights
     insights = []
-    hour_block = defaultdict(lambda: {"games": 0, "wins": 0})
-    for h, v in hour_data.items():
-        b = (h // 3) * 3
-        hour_block[b]["games"] += v["games"]; hour_block[b]["wins"] += v["wins"]
 
-    best_b  = max(hour_block.items(), key=lambda x: x[1]["wins"]/x[1]["games"] if x[1]["games"]>=10 else 0, default=None)
-    worst_b = min(hour_block.items(), key=lambda x: x[1]["wins"]/x[1]["games"] if x[1]["games"]>=10 else 1, default=None)
-    if best_b and best_b[1]["games"] >= 10:
-        bh = best_b[0]; br = round(best_b[1]["wins"]/best_b[1]["games"]*100,1)
-        insights.append(("good", f"You win **{br}%** of games between {fmt_h(bh)}–{fmt_h(bh+3)} — your sharpest window."))
-    if worst_b and worst_b[1]["games"] >= 10:
-        wh = worst_b[0]; wr = round(worst_b[1]["wins"]/worst_b[1]["games"]*100,1)
-        insights.append(("bad", f"Avoid playing at {fmt_h(wh)}–{fmt_h(wh+3)} — only **{wr}%** win rate."))
+    elig = {k: v for k, v in blocks.items() if v[0] >= 10}
+    if elig:
+        best_b = max(elig.items(), key=lambda kv: wilson_lo(kv[1][1]/kv[1][0], kv[1][0]))
+        wr = best_b[1][1] / best_b[1][0] * 100
+        insights.append(("good", f"**{block_label(best_b[0])}** is your sharpest window — "
+                                 f"**{wr:.0f}%** score over {best_b[1][0]} games."))
+        worst_b = min(elig.items(), key=lambda kv: wilson_lo(kv[1][1]/kv[1][0], kv[1][0]))
+        wrr = worst_b[1][1] / worst_b[1][0] * 100
+        if worst_b[0] != best_b[0] and wrr <= wr - 12:
+            insights.append(("bad", f"Avoid **{block_label(worst_b[0])}** — only **{wrr:.0f}%** "
+                                     f"score over {worst_b[1][0]} games."))
 
-    seq_list = [(k, v["games"], round(v["wins"]/v["games"]*100,1) if v["games"] else 0) for k, v in sorted(seq_data.items())]
-    if len(seq_list) >= 4:
-        g1 = next((r for r in seq_list if r[0] == 1), None)
-        g4 = next((r for r in seq_list if r[0] >= 4), None)
-        if g1 and g4 and g1[1] >= 5 and g4[1] >= 3 and g1[2] - g4[2] > 10:
-            insights.append(("bad", f"Win rate drops **{g1[2]-g4[2]:.0f}%** after game 3 in a session. Stop at 3 games."))
+    seq_e = [g for g in games if g["sidx"] <= 3]
+    seq_l = [g for g in games if g["sidx"] >= 4]
+    if len(seq_e) >= 15 and len(seq_l) >= 10:
+        er, lr = prate(seq_e), prate(seq_l)
+        if er - lr >= 0.10:
+            insights.append(("bad", f"Score drops **{(er-lr)*100:.0f} pts** from game 4 onward "
+                                     f"({er*100:.0f}% → {lr*100:.0f}%). Cap sessions at 3."))
 
-    best_day = max(day_data.items(), key=lambda x: x[1]["wins"]/x[1]["games"] if x[1]["games"]>=10 else 0, default=None)
-    if best_day and best_day[1]["games"] >= 10:
-        wr = round(best_day[1]["wins"]/best_day[1]["games"]*100,1)
-        insights.append(("good", f"**{DAY_NAMES[best_day[0]]}** is your best day — **{wr}%** win rate."))
+    tilted = [g for g in games if g["prior_loss_streak"] >= 2]
+    fresh  = [g for g in games if g["prior_loss_streak"] == 0]
+    if len(tilted) >= 10 and len(fresh) >= 15:
+        tr, fr = prate(tilted), prate(fresh)
+        if fr - tr >= 0.10:
+            insights.append(("bad", f"After 2 straight losses your score is **{tr*100:.0f}%** vs "
+                                     f"**{fr*100:.0f}%** normally. Tilt is real — take the break."))
 
-    return {"hour_rows": hour_rows, "day_rows": day_rows, "seq_rows": seq_rows, "insights": insights}
+    elig_days = {k: v for k, v in days.items() if v[0] >= 12}
+    if elig_days:
+        bd = max(elig_days.items(), key=lambda kv: kv[1][1] / kv[1][0])
+        insights.append(("good", f"**{DAY_NAMES[bd[0]]}** is your best day — "
+                                 f"**{bd[1][1]/bd[1][0]*100:.0f}%** score over {bd[1][0]} games."))
 
+    return {"block_rows": block_rows, "day_rows": day_rows,
+            "seq_rows": seq_rows, "insights": insights}
 
 # ─── Analysis 3: Losing Recipe ────────────────────────────────────────────────
 def losing_recipe(games: list[dict]) -> dict:
@@ -319,88 +478,116 @@ def losing_recipe(games: list[dict]) -> dict:
     lr_overall = len(losses) / total
 
     patterns = []
+    def check(sub, label, min_n=15):
+        n = len(sub)
+        if n < min_n: return
+        l = sum(1 for g in sub if g["lost"]) / n
+        lift = l / lr_overall if lr_overall else 1
+        if lift >= 1.15 and l >= lr_overall + 0.08:
+            patterns.append({"label": label, "games": n, "loss_rate": round(l*100, 1),
+                             "overall": round(lr_overall*100, 1), "lift": round(lift, 2)})
 
-    def check(subset, label, min_g=20):
-        n = len(subset)
-        if n < min_g: return
-        nl = sum(1 for g in subset if g["lost"])
-        rate = nl / n
-        lift = rate / lr_overall if lr_overall else 1
-        if lift > 1.2:
-            patterns.append({"label": label, "games": n, "loss_rate": round(rate*100,1),
-                              "overall": round(lr_overall*100,1), "lift": round(lift,2)})
+    check([g for g in games if g["color"] == "black"], "Playing as Black")
+    check([g for g in games if g["color"] == "white"], "Playing as White")
+    check([g for g in games if g["moves"] >= 35], "Long games (35+ moves)")
+    check([g for g in games if g["moves"] <= 12], "Short games (≤12 moves)")
+    check([g for g in games if g["sidx"] >= 4], "4th+ game of a session", 12)
+    check([g for g in games if g["prior_loss_streak"] >= 2], "Right after 2+ straight losses", 12)
+    check([g for g in games if g["dt"] and (g["dt"].hour >= 22 or g["dt"].hour < 5)],
+          "Late night (10 PM – 5 AM)", 10)
 
-    check([g for g in games if g["color"]=="black"], "Playing as Black")
-    check([g for g in games if g["color"]=="white"], "Playing as White")
-    check([g for g in games if g["move_count"] >= 35], "Long games (35+ moves)")
-    check([g for g in games if g["move_count"] <= 20], "Short games (≤20 moves)")
-    check([g for g in games if g["opp_rating"] - g["player_rating"] > 100], "Opponent 100+ above you", 15)
-    check([g for g in games if g["dt"] and g["dt"].hour >= 22], "Playing after 10 PM", 10)
-
-    oc = defaultdict(lambda: {"games": 0, "losses": 0})
+    oc = defaultdict(lambda: [0, 0])
     for g in games:
         key = f"{g['color']}|{g['opening']}"
-        oc[key]["games"] += 1; oc[key]["losses"] += int(g["lost"])
-    for key, d in oc.items():
-        if d["games"] < 10: continue
-        color_str, opening_str = key.split("|", 1)
-        rate = d["losses"] / d["games"]; lift = rate / lr_overall if lr_overall else 1
-        if lift > 1.5:
-            patterns.append({"label": f"{opening_str} as {color_str.title()}", "games": d["games"],
-                              "loss_rate": round(rate*100,1), "overall": round(lr_overall*100,1), "lift": round(lift,2)})
+        oc[key][0] += 1
+        oc[key][1] += 1 if g["lost"] else 0
+    for key, (n, l) in oc.items():
+        if n < 10: continue
+        rate = l / n
+        lift = rate / lr_overall if lr_overall else 1
+        if lift >= 1.25 and rate >= lr_overall + 0.08:
+            c, o = key.split("|", 1)
+            patterns.append({"label": f"{o} as {c.title()}", "games": n,
+                             "loss_rate": round(rate*100, 1),
+                             "overall": round(lr_overall*100, 1), "lift": round(lift, 2)})
 
     patterns.sort(key=lambda p: p["lift"], reverse=True)
-    sentences = [
-        f"When **{p['label'].lower()}**, you lose **{p['loss_rate']}%** (vs your average of {p['overall']}%)."
-        for p in patterns[:5]
-    ]
+    sentences = [f"When **{p['label'].lower()}**, you lose **{p['loss_rate']}%** "
+                 f"(vs {p['overall']}% overall, {p['games']} games)."
+                 for p in patterns[:5]]
 
-    long_wins  = [g for g in games if g["won"] and g["move_count"] >= 35]
-    long_losses= [g for g in games if g["lost"] and g["move_count"] >= 35]
+    # How losses actually happen
+    lt = defaultdict(int)
+    for g in losses:
+        lt[g["loss_type"] or "Other"] += 1
+    loss_type_rows = [(k, v, round(v / len(losses) * 100, 1))
+                      for k, v in sorted(lt.items(), key=lambda kv: -kv[1])] if losses else []
+
+    # Actual vs Elo-expected performance by opponent strength
+    BUCKETS = [(-10**9, -200, "200+ pts weaker"), (-200, -50, "50–200 weaker"),
+               (-50, 50, "Even (±50)"), (50, 200, "50–200 stronger"),
+               (200, 10**9, "200+ pts stronger")]
+    elo_rows, elo_note = [], None
+    rated_pairs = [g for g in games if g["player_rating"] and g["opp_rating"]]
+    if rated_pairs:
+        for lo, hi, label in BUCKETS:
+            sub = [g for g in rated_pairs if lo <= g["opp_rating"] - g["player_rating"] < hi]
+            if not sub: continue
+            act = prate(sub)
+            exp = sum(expected_score(g["player_rating"], g["opp_rating"]) for g in sub) / len(sub)
+            elo_rows.append({"Opponent strength": label, "Games": len(sub),
+                             "Actual": f"{act*100:.0f}%", "Expected": f"{exp*100:.0f}%",
+                             "Δ": f"{(act-exp)*100:+.0f} pts"})
+        act_all = prate(rated_pairs)
+        exp_all = sum(expected_score(g["player_rating"], g["opp_rating"])
+                      for g in rated_pairs) / len(rated_pairs)
+        d = act_all - exp_all
+        if abs(d) >= 0.03:
+            word = "overperforming" if d > 0 else "underperforming"
+            elo_note = (f"Overall you score {act_all*100:.0f}% vs {exp_all*100:.0f}% expected "
+                        f"— you're **{word}** by {abs(d)*100:.0f} pts per game on average.")
+
+    # Endgame conversion
+    long_all = [g for g in games if g["moves"] >= 35]
     endgame_note = None
-    if long_wins or long_losses:
-        total_long = len(long_wins) + len(long_losses)
-        if total_long > 0:
-            ewr = len(long_wins) / total_long
-            if ewr < 0.4:
-                endgame_note = f"You win only **{ewr*100:.0f}%** of long games. Your endgame conversion is your biggest leak."
+    if len(long_all) >= 15:
+        lp = prate(long_all)
+        if lp < 0.45:
+            endgame_note = (f"You score only **{lp*100:.0f}%** in 35+ move games "
+                            f"({len(long_all)} games). Endgame conversion is your biggest leak.")
 
-    return {
-        "patterns": patterns[:8], "sentences": sentences,
-        "endgame_note": endgame_note,
-        "total": total, "total_losses": len(losses),
-        "overall_loss_rate": round(lr_overall*100, 1),
-    }
-
+    return {"patterns": patterns[:8], "sentences": sentences,
+            "loss_type_rows": loss_type_rows, "elo_rows": elo_rows, "elo_note": elo_note,
+            "endgame_note": endgame_note,
+            "total": total, "total_losses": len(losses),
+            "overall_loss_rate": round(lr_overall * 100, 1)}
 
 # ─── Bar chart helper ─────────────────────────────────────────────────────────
-def render_bars(rows: list[tuple], key_label: str):
-    """rows = [(label, games, win_rate)]"""
+def render_bars(rows: list, kind: str = "score"):
+    """rows = [(label, n, pct)] — pct is absolute, always scaled to 100%."""
     if not rows:
         st.caption("Not enough data yet.")
         return
-    max_wr = max(r[2] for r in rows) or 1
-    for label, games, wr in rows:
-        col1, col2, col3 = st.columns([2, 5, 1])
-        with col1:
-            st.caption(label)
-        with col2:
-            color = "#4fffb0" if wr >= 55 else "#ff5e5e" if wr <= 38 else "#7c6eff"
-            fill = int((wr / max_wr) * 100)
-            st.markdown(f"""
-            <div style="background:#1c1c22;border-radius:4px;height:18px;overflow:hidden;margin-top:4px">
-              <div style="background:{color};width:{fill}%;height:100%;border-radius:4px"></div>
-            </div>""", unsafe_allow_html=True)
-        with col3:
-            st.caption(f"**{wr}%**" if games >= 10 else "—")
-
+    for label, n, pct in rows:
+        c1, c2, c3 = st.columns([2.4, 4.2, 1.8])
+        with c1: st.caption(label)
+        with c2:
+            if kind == "score":
+                color = "#4fffb0" if pct >= 55 else "#ff5e5e" if pct <= 40 else "#7c6eff"
+            else:  # loss rates
+                color = "#ff5e5e" if pct >= 40 else "#ffb454" if pct >= 25 else "#7c6eff"
+            width = min(int(round(pct)), 100)
+            st.markdown(
+                f'<div style="background:#1c1c22;border-radius:4px;height:18px;overflow:hidden;margin-top:4px">'
+                f'<div style="background:{color};width:{width}%;height:100%;border-radius:4px"></div></div>',
+                unsafe_allow_html=True)
+        with c3: st.caption(f"**{pct:.0f}%** · {n}g")
 
 # ─── Main App ─────────────────────────────────────────────────────────────────
 st.markdown("# ♟️ Chess Insights")
 st.markdown("*3 things about your chess that actually matter — no engine, no noise.*")
 st.divider()
 
-# Username input
 col1, col2 = st.columns([4, 1])
 with col1:
     username = st.text_input("", placeholder="Chess.com username…", label_visibility="collapsed")
@@ -419,48 +606,94 @@ if not username:
     </div>""", unsafe_allow_html=True)
     st.stop()
 
-username = username.strip().lower()
-
-# Time class selector
-time_class = st.radio(
-    "Time class", ["rapid", "blitz", "bullet"],
-    horizontal=True, label_visibility="collapsed",
-    index=0,
-)
-
-# Fetch games
-with st.spinner(f"Loading {username}'s games…"):
-    raw_games = fetch_all_games(username)
-
-if not raw_games:
-    st.error(f"❌ Could not find **{username}** on Chess.com. Check the username and try again.")
+username = clean_username(username)
+if not username:
+    st.error("That doesn't look like a valid Chess.com username (3–25 chars, letters/numbers/`-`/`_`).")
     st.stop()
 
-games = get_games(raw_games, username, time_class)
+# ─── Controls ────────────────────────────────────────────────────────────────
+time_class = st.radio("Time class", ["rapid", "blitz", "bullet", "daily"],
+                      horizontal=True, label_visibility="collapsed", index=0)
 
-# Player overview
+try:
+    detected_tz = st.context.timezone          # browser tz (Streamlit ≥ 1.38)
+except Exception:
+    detected_tz = None
+
+tz_list = list(TIMEZONES)
+if detected_tz and detected_tz not in tz_list:
+    tz_list.insert(0, detected_tz)
+default_tz = detected_tz if detected_tz in tz_list else "UTC"
+
+c1, c2, c3 = st.columns([1.4, 1.6, 1])
+with c1:
+    depth_label = st.selectbox("History", list(DEPTH_OPTIONS), index=2)
+with c2:
+    tz_label = st.selectbox("Timezone", tz_list, index=tz_list.index(default_tz))
+with c3:
+    rated_only = st.checkbox("Rated only", value=True)
+
+months = DEPTH_OPTIONS[depth_label]
+
+# ─── Fetch ───────────────────────────────────────────────────────────────────
+status = check_player(username)
+if status == 404:
+    st.error(f"❌ Could not find **{username}** on Chess.com. Check the username and try again.")
+    st.stop()
+if status != 200:
+    st.error("⚠️ Chess.com API is unreachable right now. Please try again in a moment.")
+    st.stop()
+
+with st.spinner(f"Loading {username}'s games…"):
+    raw_games = fetch_all_games(username, months)
+
+if not raw_games:
+    st.error(f"No games found for **{username}** in the selected period. Try a longer history.")
+    st.stop()
+
+games = get_games(raw_games, username, time_class, tz_label, rated_only)
+
+if not games:
+    st.warning(f"No rated {time_class} games found for **{username}** in this period. "
+               f"Try a different time class, disable 'Rated only', or extend the history.")
+    st.stop()
+
+# ─── Overview ─────────────────────────────────────────────────────────────────
 wins   = sum(1 for g in games if g["won"])
 losses = sum(1 for g in games if g["lost"])
-draws  = sum(1 for g in games if g["drew"])
+draws  = len(games) - wins - losses
 total  = len(games)
-current_rating = games[-1]["player_rating"] if games else 0
+score  = (wins + 0.5 * draws) / total
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Total Games",    f"{total:,}")
-c2.metric("Win Rate",       f"{wins/total*100:.0f}%" if total else "—")
-c3.metric("Wins",           f"{wins:,}")
-c4.metric("Current Rating", current_rating)
+latest_r = next((g["player_rating"] for g in reversed(games) if g["player_rating"] > 0), None)
+opp_ratings = [g["opp_rating"] for g in games if g["opp_rating"] > 0]
+avg_opp = round(sum(opp_ratings) / len(opp_ratings)) if opp_ratings else None
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Games", f"{total:,}")
+m2.metric("Score (W=1, D=½)", f"{score*100:.0f}%")
+m3.metric("Latest Rating", f"{latest_r}" if latest_r else "—")
+m4.metric("Avg Opponent", f"{avg_opp}" if avg_opp else "—")
+
+if games[0]["dt"] and games[-1]["dt"]:
+    st.caption(f"{wins}W / {draws}D / {losses}L · "
+               f"{games[0]['dt'].strftime('%b %d, %Y')} → {games[-1]['dt'].strftime('%b %d, %Y')} · "
+               f"times shown in **{tz_label}**")
+
+chart_data = [(g["dt"], g["player_rating"]) for g in games[-200:]
+              if g["dt"] and g["player_rating"] > 0]
+if len(chart_data) >= 2:
+    st.markdown("**Rating over time** (last 200 games)")
+    df = pd.DataFrame(chart_data, columns=["date", "rating"]).set_index("date")
+    df["20-game trend"] = df["rating"].rolling(20, min_periods=5).mean()
+    st.line_chart(df, height=230, use_container_width=True)
 
 st.divider()
 
-if not games:
-    st.warning(f"No {time_class} games found for **{username}**. Try a different time class.")
-    st.stop()
-
-# ─── Tabs ─────────────────────────────────────────────────────────────────────
+# ─── Tabs ────────────────────────────────────────────────────────────────────
 tab1, tab2, tab3 = st.tabs(["📌 One Fix This Week", "🕐 Best Time to Play", "🧬 Losing Recipe"])
 
-# ── Tab 1: One Fix ────────────────────────────────────────────────────────────
+# ── Tab 1 ────────────────────────────────────────────────────────────────────
 with tab1:
     fix = one_fix(games)
     if not fix:
@@ -477,7 +710,7 @@ with tab1:
             </div>
         </div>
         <div style="font-size:0.78rem;color:#6b6b80;margin-top:0.5rem">
-            Based on your {fix['window']} · {fix['wins']}W / {fix['losses']}L / {fix['draws']}D ({fix['win_rate']}% win rate)
+            Based on your {fix['window']} · {fix['wins']}W / {fix['losses']}L / {fix['draws']}D ({fix['score']}% score)
         </div>
         """, unsafe_allow_html=True)
 
@@ -486,58 +719,80 @@ with tab1:
                 for other in fix["others"]:
                     st.markdown(f"- {other}")
 
-# ── Tab 2: Best Time ──────────────────────────────────────────────────────────
+# ── Tab 2 ────────────────────────────────────────────────────────────────────
 with tab2:
     bt = best_time(games)
 
+    for cls, text in bt.get("insights", []):
+        box_cls = "good" if cls == "good" else "bad"
+        st.markdown(f'<div class="insight-box {box_cls}">{text}</div>', unsafe_allow_html=True)
     if bt.get("insights"):
-        for cls, text in bt["insights"]:
-            box_cls = "good" if cls == "good" else "bad"
-            st.markdown(f'<div class="insight-box {box_cls}">{text}</div>', unsafe_allow_html=True)
         st.markdown("")
 
-    st.markdown("**Win Rate by Hour (your local time)**")
-    render_bars(bt.get("hour_rows", []), "Hour")
+    st.markdown("**Score by time of day**")
+    render_bars(bt.get("block_rows", []))
+    st.caption("3-hour blocks. Treat any bar under ~10 games as noise.")
 
     st.markdown("")
-    st.markdown("**Win Rate by Day of Week**")
-    render_bars(bt.get("day_rows", []), "Day")
+    st.markdown("**Score by day of week**")
+    render_bars(bt.get("day_rows", []))
 
     st.markdown("")
-    st.markdown("**Win Rate by Game # in Session**")
-    render_bars(bt.get("seq_rows", []), "Game #")
+    st.markdown("**Score by game # in session**")
+    render_bars(bt.get("seq_rows", []))
+    st.caption("A session = games with no gap longer than 45 minutes. Score = wins + ½·draws ÷ games.")
 
-# ── Tab 3: Losing Recipe ──────────────────────────────────────────────────────
+# ── Tab 3 ────────────────────────────────────────────────────────────────────
 with tab3:
     lr = losing_recipe(games)
     if not lr:
         st.info("Not enough data.")
     else:
-        st.markdown(f"You lose **{lr['overall_loss_rate']}%** of your {lr['total']} {time_class} games. Here's when it's much worse.")
-        st.markdown("")
+        if lr["total_losses"] == 0:
+            st.success(f"You haven't lost a single one of your last {lr['total']} games. 🎉")
+        else:
+            st.markdown(f"You lose **{lr['overall_loss_rate']}%** of your {lr['total']} {time_class} "
+                        f"games. Here's when it's much worse.")
 
         if lr.get("sentences"):
-            st.markdown("**Your Losing Patterns**")
+            st.markdown("")
+            st.markdown("**Your losing patterns**")
             for s in lr["sentences"]:
                 st.markdown(f'<div class="insight-box bad">{s}</div>', unsafe_allow_html=True)
-            st.markdown("")
 
-        if lr.get("endgame_note"):
-            st.warning(lr["endgame_note"])
+        if lr.get("loss_type_rows"):
+            st.markdown("")
+            st.markdown("**How your losses happen**")
+            render_bars(lr["loss_type_rows"], kind="loss")
+
+        if lr.get("elo_note"):
+            st.markdown("")
+            st.info(lr["elo_note"])
+        if lr.get("elo_rows"):
+            st.markdown("**Actual vs expected (Elo)**")
+            st.caption("Expected score from the rating difference — 'Δ' is your over/underperformance.")
+            st.dataframe(pd.DataFrame(lr["elo_rows"]), hide_index=True, use_container_width=True)
 
         if lr.get("patterns"):
-            st.markdown("**Loss Rate Breakdown**")
-            for p in lr["patterns"]:
-                c1, c2, c3 = st.columns([3, 4, 2])
-                with c1: st.caption(p["label"])
-                with c2:
-                    fill = int(min(p["loss_rate"], 100))
-                    st.markdown(f"""
-                    <div style="background:#1c1c22;border-radius:4px;height:18px;overflow:hidden;margin-top:4px">
-                      <div style="background:#ff5e5e;width:{fill}%;height:100%;border-radius:4px"></div>
-                    </div>""", unsafe_allow_html=True)
-                with c3:
-                    st.caption(f"**{p['loss_rate']}%** · {p['games']} games")
+            st.markdown("")
+            st.markdown("**Loss rate breakdown**")
+            render_bars([(p["label"], p["games"], p["loss_rate"]) for p in lr["patterns"]], kind="loss")
+
+        if lr.get("endgame_note"):
+            st.markdown("")
+            st.warning(lr["endgame_note"])
 
 st.divider()
+
+with st.expander("How these stats work"):
+    st.markdown("""
+    - **Score** = wins + ½·draws ÷ games (draws count, unlike raw win rate).
+    - **Draws** are detected from both players' results — neither has `win`.
+    - **Variants** (Chess960, crazyhouse…), unrated and 0-move auto-aborted games are excluded.
+    - **Sessions** = games separated by gaps under 45 minutes (not calendar days).
+    - **Best/worst hours** are ranked by Wilson lower bound, so small samples can't fake a "best hour".
+    - **Expected score** uses the standard Elo formula: 1 / (1 + 10^((opp−you)/400)).
+    - Games come from the Chess.com public API and are cached for 1 hour.
+    """)
+
 st.caption("Data fetched from Chess.com public API · No engine · No personal data stored")
