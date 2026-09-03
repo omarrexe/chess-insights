@@ -5,8 +5,10 @@ Chess Insights — Streamlit App
 v2 — accuracy + usefulness pass
 """
 
+import html as _html
 import math
 import re
+import statistics
 import time as time_mod
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -15,6 +17,13 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
+
+try:
+    import plotly.graph_objects as go
+    HAS_PLOTLY = True
+except Exception:
+    HAS_PLOTLY = False
 
 # ─── Page config ─────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -562,6 +571,651 @@ def losing_recipe(games: list[dict]) -> dict:
             "total": total, "total_losses": len(losses),
             "overall_loss_rate": round(lr_overall * 100, 1)}
 
+# ─── Opening Recipe module ────────────────────────────────────────────────────
+
+# ── PGN → move tokens ────────────────────────────────────────────────────────
+def movetext_tokens(pgn: str) -> list:
+    if not pgn: return []
+    parts = pgn.split("\n\n", 1)
+    mt = parts[1] if len(parts) == 2 else parts[0]
+    mt = re.sub(r"(1-0|0-1|1/2-1/2|\*)\s*$", " ", mt.strip())
+    mt = re.sub(r"\{[^}]*\}", " ", mt)
+    mt = re.sub(r";[^\n]*", " ", mt)
+    mt = re.sub(r"\$\d+", " ", mt)
+    mt = re.sub(r"\b\d+\.*", " ", mt)
+    out = []
+    for t in mt.split():
+        t = t.rstrip("+#!?")
+        if SAN_RE.fullmatch(t):
+            out.append(t)
+    return out
+
+# ── Mini opening book (mainlines, in plies) ──────────────────────────────────
+BOOK_LINES = [
+    "e4 e5 Nf3 Nc6 Bb5 a6", "e4 e5 Nf3 Nc6 Bb5 Nf6", "e4 e5 Nf3 Nc6 Bc4 Bc5",
+    "e4 e5 Nf3 Nc6 Bc4 Nf6", "e4 e5 Nf3 Nc6 d4 exd4 Nxd4",
+    "e4 e5 Nf3 Nc6 Nc3", "e4 e5 Nf3 Nf6 Nxe5", "e4 e5 Nf3 d6 d4",
+    "e4 e5 Nc3 Nf6", "e4 e5 f4 exf4", "e4 e5 f4 d5", "e4 e5 Bc4 Nf6",
+    "e4 e5 Nf3 Nc6 d3", "e4 e5 d4 exd4 Qxd4", "e4 e5 c4", "e4 e5 c3",
+    "e4 c5 Nf3 d6 d4 cxd4 Nxd4 Nf6 Nc3 a6",
+    "e4 c5 Nf3 d6 d4 cxd4 Nxd4 Nf6 Nc3 e6",
+    "e4 c5 Nf3 d6 d4 cxd4 Nxd4 Nf6 Nc3 g6",
+    "e4 c5 Nf3 d6 d4 cxd4 Nxd4 Nf6 Nc3 Nc6",
+    "e4 c5 Nf3 Nc6 d4 cxd4 Nxd4", "e4 c5 Nf3 e6 d4 cxd4 Nxd4",
+    "e4 c5 Nf3 e6 d4 cxd4 Nxd4 Nc6", "e4 c5 Nc3", "e4 c5 c3", "e4 c5 g3",
+    "e4 c6 d4 d5 Nc3 dxe4 Nxe4 Bf5", "e4 c6 d4 d5 Nc3 dxe4 Nxe4 Nf6",
+    "e4 c6 d4 d5 e5 c5", "e4 c6 d4 d5 exd5 cxd5 c4", "e4 c6 Nc3 d5 Nf3",
+    "e4 e6 d4 d5 Nc3 Bb4", "e4 e6 d4 d5 Nc3 Nf6", "e4 e6 d4 d5 Nd2",
+    "e4 e6 d4 d5 e5", "e4 e6 d4 d5 exd5 exd5", "e4 e6 d4 Nf6",
+    "e4 d5 exd5 Qxd5 Nc3", "e4 d5 exd5 Nf6", "e4 d5 Nf3", "e4 d5 e5",
+    "e4 Nf6", "e4 d6 d4 Nf6 Nc3 g6", "e4 g6 d4 Nf6 Nc3 d6",
+    "e4 g6 d4 Bg7", "e4 b6 d4 Bb7", "e4 a6", "e4 Nc6", "e4 b5",
+    "d4 d5 c4 e6 Nc3 Nf6 Bg5 Be7", "d4 d5 c4 e6 Nc3 Nf6 Nf3",
+    "d4 d5 c4 e6 cxd5 exd5", "d4 d5 c4 e6 Bg5",
+    "d4 d5 c4 c6 Nf3 Nf6 Nc3", "d4 d5 c4 c6 Nc3 Nf6",
+    "d4 d5 c4 dxc4", "d4 d5 c4 e5", "d4 d5 Nf3 Nf6 Bf4",
+    "d4 d5 Nf3 Nf6 c4", "d4 d5 Bf4", "d4 d5 e4",
+    "d4 Nf6 c4 e6 Nc3 Bb4", "d4 Nf6 c4 e6 Nf3 b6", "d4 Nf6 c4 e6 g3",
+    "d4 Nf6 c4 g6 Nc3 Bg7 e4 d6", "d4 Nf6 c4 g6 Nc3 d5",
+    "d4 Nf6 c4 g6 Nf3 Bg7", "d4 Nf6 Bf4", "d4 Nf6 c4 e6 Nc3 Bb4 e3",
+    "d4 f5 g3 Nf6 Bg2", "d4 f5", "d4 e6", "d4 c5", "d4 b6", "d4 d6",
+    "c4 e5", "c4 Nf6", "c4 c5", "c4 e6", "c4 c6",
+    "Nf3 d5", "Nf3 Nf6", "Nf3 c5",
+    "g3 d5", "g3 Nf6", "b3 e5", "b3 d5", "f4 d5", "f4 Nf6",
+    "e4", "d4",
+]
+BOOK_TOKENS = [l.split() for l in BOOK_LINES]
+
+def book_depth(tokens: list) -> int:
+    """How many plies of a known mainline the game follows."""
+    best, n = 0, len(tokens)
+    for line in BOOK_TOKENS:
+        L = min(len(line), n)
+        if L > best and tokens[:L] == line[:L]:
+            best = L
+    return best
+
+# ── Opening family detection ──────────────────────────────────────────────────
+FAMILY_RULES = [
+    ("caro kann", "Caro-Kann"), ("sicilian", "Sicilian Defense"),
+    ("french", "French Defense"), ("scandinavian", "Scandinavian"),
+    ("alekhine", "Alekhine's Defense"), ("pirc", "Pirc Defense"),
+    ("modern", "Modern Defense"), ("kings gambit", "King's Gambit"),
+    ("ruy lopez", "Ruy Lopez"), ("spanish", "Ruy Lopez"),
+    ("italian", "Italian Game"), ("giuoco", "Italian Game"),
+    ("evans gambit", "Italian Game"), ("scotch", "Scotch Game"),
+    ("vienna", "Vienna Game"), ("petroff", "Petrov Defense"),
+    ("petrov", "Petrov Defense"), ("russian game", "Petrov Defense"),
+    ("philidor", "Philidor Defense"), ("london", "London System"),
+    ("catalan", "Catalan Opening"), ("queens gambit", "Queen's Gambit"),
+    ("semi slav", "Slav / Semi-Slav"), ("slav", "Slav / Semi-Slav"),
+    ("nimzo indian", "Nimzo-Indian"), ("queens indian", "Queen's Indian"),
+    ("kings indian", "King's Indian"), ("gruenfeld", "Grunfeld Defense"),
+    ("grunfeld", "Grunfeld Defense"), ("benoni", "Benoni Defense"),
+    ("budapest", "Budapest Gambit"), ("dutch", "Dutch Defense"),
+    ("english", "English Opening"), ("reti", "Reti Opening"),
+    ("birds", "Bird's Opening"), ("four knights", "Four Knights"),
+    ("two knights", "Two Knights Defense"), ("danish", "Danish Gambit"),
+    ("center game", "Center Game"), ("ponziani", "Ponziani"),
+    ("bishops opening", "Bishop's Opening"), ("bowdler", "Bishop's Opening"),
+    ("kings pawn", "1.e4 Games"), ("king pawn", "1.e4 Games"),
+    ("queens pawn", "1.d4 Games"),
+]
+REPLY_FAMILY = {
+    ("e4","e5"): "Open Games (1.e4 e5)", ("e4","c5"): "Sicilian Defense",
+    ("e4","c6"): "Caro-Kann", ("e4","e6"): "French Defense",
+    ("e4","d5"): "Scandinavian", ("e4","d6"): "Pirc Defense",
+    ("e4","g6"): "Modern Defense", ("e4","Nf6"): "Alekhine's Defense",
+    ("e4","b6"): "Owen's Defense", ("e4","a6"): "St. George Defense",
+    ("e4","Nc6"): "Nimzowitsch Defense", ("e4","b5"): "1.e4 b5",
+    ("d4","d5"): "d4 d5 Closed", ("d4","Nf6"): "Indian Defenses",
+    ("d4","f5"): "Dutch Defense", ("d4","e6"): "1.d4 e6 Systems",
+    ("d4","c5"): "1.d4 c5", ("d4","d6"): "1.d4 d6 Systems",
+    ("d4","g6"): "Modern vs d4", ("d4","b6"): "1.d4 b6",
+    ("c4",None): "English Opening", ("Nf3",None): "Reti Opening",
+    ("g3",None): "King's Fianchetto", ("b3",None): "Nimzo-Larsen Attack",
+    ("f4",None): "Bird's Opening", ("b4",None): "Polish Opening",
+    ("e4",None): "1.e4 (other)", ("d4",None): "1.d4 (other)",
+}
+
+def classify_opening(name: str, tokens: list) -> tuple:
+    """Return (family, variation-with-family-name-stripped)."""
+    n = name.lower()
+    fam = "Other"
+    for key, f in FAMILY_RULES:
+        if key in n:
+            fam = f
+            break
+    else:
+        if len(tokens) >= 2 and (tokens[0], tokens[1]) in REPLY_FAMILY:
+            fam = REPLY_FAMILY[(tokens[0], tokens[1])]
+        elif tokens and (tokens[0], None) in REPLY_FAMILY:
+            fam = REPLY_FAMILY[(tokens[0], None)]
+    var = name
+    if name.lower().startswith(fam.lower()):
+        rest = name[len(fam):].strip()
+        if rest: var = rest
+    return fam, var
+
+# ── Lab game parser ───────────────────────────────────────────────────────────
+def prepare_lab_games(raw_games, username, time_class, tz_label, rated_only):
+    tz, u, out = get_tz(tz_label), username.lower(), []
+    for g in raw_games:
+        white, black = g.get("white", {}), g.get("black", {})
+        if white.get("username","").lower() == u:   color, me, opp = "white", white, black
+        elif black.get("username","").lower() == u: color, me, opp = "black", black, white
+        else: continue
+        if g.get("time_class") != time_class: continue
+        if g.get("rules", "chess") != "chess": continue
+        if rated_only and not g.get("rated", True): continue
+
+        r, o = me.get("result","") or "", opp.get("result","") or ""
+        won, lost = r == "win", (o == "win") or (r in LOSS_RESULTS)
+        drew = not won and not lost
+
+        pgn = g.get("pgn","") or ""
+        tokens = movetext_tokens(pgn)
+        if not tokens: continue
+
+        eco_m = re.search(r'\[ECOUrl "([^"]+)"\]', pgn)
+        vname = eco_m.group(1).split("/")[-1].replace("-"," ").title() if eco_m else "Unknown"
+        family, variation = classify_opening(vname, tokens)
+
+        ts = g.get("end_time") or 0
+        dt = datetime.fromtimestamp(ts, tz) if ts else None
+        out.append({
+            "end_time": ts, "dt": dt, "color": color,
+            "won": won, "drew": drew, "lost": lost,
+            "loss_type": LOSS_TYPE.get(r, "Other") if lost else None,
+            "player_rating": me.get("rating",0) or 0,
+            "opp_rating": opp.get("rating",0) or 0,
+            "plies": len(tokens), "moves": (len(tokens)+1)//2,
+            "first": tokens[0], "reply": tokens[1] if len(tokens)>1 else "",
+            "family": family, "variation": variation, "variation_raw": vname,
+            "book": book_depth(tokens[:12]),
+            "month": dt.strftime("%Y-%m") if dt else "",
+        })
+    out.sort(key=lambda g: g["end_time"])
+    return out
+
+# ── Stats helpers ─────────────────────────────────────────────────────────────
+def phase_shares(losses):
+    keys = ("Opening (≤12)", "Middlegame (13–30)", "Endgame (31+)")
+    if not losses:
+        return {k: 0 for k in keys}
+    t = len(losses)
+    return {
+        keys[0]: round(sum(1 for g in losses if g["moves"] <= 12) / t * 100),
+        keys[1]: round(sum(1 for g in losses if 12 < g["moves"] <= 30) / t * 100),
+        keys[2]: round(sum(1 for g in losses if g["moves"] > 30) / t * 100),
+    }
+
+def grade_of(score, overall):
+    d = score - overall
+    return "A" if d >= .12 else "B" if d >= .05 else "C" if d >= -.05 else "D" if d >= -.12 else "F"
+
+GRADE_COLORS = {"A":"#4fffb0","B":"#7ee787","C":"#7c6eff","D":"#ffb454","F":"#ff5e5e"}
+
+def family_cards(lab, min_games=6):
+    overall = prate(lab)
+    groups = defaultdict(list)
+    for g in lab:
+        groups[(g["color"], g["family"])].append(g)
+    cards = []
+    for (color, fam), gs in groups.items():
+        n = len(gs)
+        if n < min_games: continue
+        sc = prate(gs)
+        losses = [g for g in gs if g["lost"]]
+        half = n // 2
+        trend = round((prate(gs[half:]) - prate(gs[:half])) * 100) if n >= 12 else None
+        cards.append({
+            "family": fam, "color": color, "games": n,
+            "score": round(sc*100, 1), "delta": round((sc-overall)*100, 1),
+            "grade": grade_of(sc, overall),
+            "median_moves": round(statistics.median(g["moves"] for g in gs)),
+            "phases": phase_shares(losses), "losses": len(losses),
+            "avg_book": statistics.mean(g["book"] for g in gs),
+            "trend": trend,
+        })
+    cards.sort(key=lambda c: c["games"], reverse=True)
+    return cards, overall
+
+def card_verdict(c):
+    ph = c["phases"]
+    if c["losses"] == 0:
+        return "No losses here yet — keep it in the rotation."
+    if ph["Opening (≤12)"] >= 45:
+        return "Most losses come by move 12 — you're not surviving the theory. Learn the first 10 moves cold."
+    if ph["Endgame (31+)"] >= 45:
+        return "Losses pile up late — good positions, bad conversion. Study this structure's typical endgames."
+    if c["avg_book"] < 8:
+        return f"You leave known theory around move {c['avg_book']/2:.0f} — too early. 20 min of prep here pays off."
+    if c["delta"] >= 5:
+        return "This is a weapon — make it your main line."
+    return "Decent results — sharpen the typical middlegame plans."
+
+# ── Recipe builder ────────────────────────────────────────────────────────────
+STYLE_WHY = {
+    "trap_prone":    "Most of your losses happen EARLY (by move 12) — you need trap-proof, low-theory lines, not more sharpness.",
+    "leaky_endgame": "Most of your losses happen LATE (move 31+) — you need clean structures you can convert.",
+    "attacker":     "Your games are short and your wins come fast — lean into sharp, fighting lines.",
+    "balanced":     "Your losses are spread evenly across the game — solid all-round lines will serve you best.",
+}
+STYLE_RECS = {
+    "trap_prone": {
+        "white": ("London System", "1.d4 2.Nf3 3.Bf4 — the same setup vs almost everything", "one setup, almost no forced traps to memorize"),
+        "e4":    ("Caro-Kann", "1.e4 c6 2.d4 d5 3.Nc3 dxe4 4.Nxe4 Bf5", "rock-solid, trap-proof, clear plans"),
+        "d4":    ("Slav", "1.d4 d5 2.c4 c6 3.Nf3 Nf6 4.Nc3", "solid structure, very hard to blow off the board"),
+    },
+    "leaky_endgame": {
+        "white": ("London System", "1.d4 2.Nf3 3.Bf4 — trade pieces, grind endgames", "reaches simple favorable endgames constantly"),
+        "e4":    ("Caro-Kann", "1.e4 c6 2.d4 d5 3.Nc3 dxe4 4.Nxe4 Bf5", "great endgame structures and pawn skeletons"),
+        "d4":    ("Queen's Gambit Declined", "1.d4 d5 2.c4 e6 3.Nc3 Nf6 4.Nf3 Be7", "simple, clear plans all the way to the ending"),
+    },
+    "attacker": {
+        "white": ("Italian Game, c3–d4 plan", "1.e4 e5 2.Nf3 Nc6 3.Bc4 Bc5 4.c3", "clean attacking setup, low theory, high initiative"),
+        "e4":    ("Najdorf Sicilian", "1.e4 c5 2.Nf3 d6 3.d4 cxd4 4.Nxd4 Nf6 5.Nc3 a6", "maximum fight — you decide where the game burns"),
+        "d4":    ("King's Indian Defense", "1.d4 Nf6 2.c4 g6 3.Nc3 Bg7 4.e4 d6", "counterattack the king — fits your fast-win profile"),
+    },
+    "balanced": {
+        "white": ("Italian Game", "1.e4 e5 2.Nf3 Nc6 3.Bc4", "main lines, best all-round results at club level"),
+        "e4":    ("Open Sicilian", "1.e4 c5 2.Nf3 Nc6 3.d4 cxd4 4.Nxd4", "the serious answer to 1.e4 — scores bump lives here"),
+        "d4":    ("Nimzo-Indian", "1.d4 Nf6 2.c4 e6 3.Nc3 Bb4", "fights for the initiative without huge theory"),
+    },
+}
+
+def infer_style(phases, avg_moves):
+    if phases["Opening (≤12)"] >= 45: return "trap_prone"
+    if phases["Endgame (31+)"] >= 40: return "leaky_endgame"
+    if avg_moves <= 22:                return "attacker"
+    return "balanced"
+
+def pick_core(stats, min_n=8):
+    ok = [s for s in stats if s["games"] >= min_n] or stats
+    if not ok: return None
+    return max(ok, key=lambda s: wilson_lo(s["score"]/100, s["games"]))
+
+def build_recipe(lab, cards, overall):
+    white_groups, e4_groups, d4_groups = defaultdict(list), defaultdict(list), defaultdict(list)
+    for g in lab:
+        if g["color"] == "white":
+            white_groups[f"1.{g['first']}"].append(g)
+        elif g["first"] == "e4":
+            e4_groups[g["family"]].append(g)
+        elif g["first"] == "d4":
+            d4_groups[g["family"]].append(g)
+
+    def to_stats(d):
+        return [{"label": k, "games": len(v), "score": round(prate(v)*100,1)} for k, v in d.items()]
+
+    white_stats, e4_stats, d4_stats = to_stats(white_groups), to_stats(e4_groups), to_stats(d4_groups)
+    junk = ("Other", "Unknown")
+    core_white = pick_core([s for s in white_stats if s["label"] not in junk])
+    core_e4 = pick_core([s for s in e4_stats if s["label"] not in junk])
+    core_d4 = pick_core([s for s in d4_stats if s["label"] not in junk])
+
+    losses = [g for g in lab if g["lost"]]
+    phases = phase_shares(losses)
+    style = infer_style(phases, statistics.mean(g["moves"] for g in lab))
+
+    keep = [c for c in cards if c["delta"] >= 3 and c["games"] >= 8]
+    cut  = [c for c in cards if c["delta"] <= -8 and c["games"] >= 6]
+    fix = []
+    traps = defaultdict(int)
+    for g in losses:
+        if g["moves"] <= 12 and g["loss_type"] == "Checkmated":
+            traps[(g["color"], g["family"])] += 1
+    for (color, fam), cnt in sorted(traps.items(), key=lambda kv: -kv[1])[:3]:
+        if cnt >= 2:
+            fix.append(f"<b>{fam}</b> as {color}: mated inside 12 moves {cnt}× — that's a known trap. Learn the refutation before playing it again.")
+    for c in cards:
+        if c["phases"]["Opening (≤12)"] >= 45 and c["losses"] >= 4:
+            fix.append(f"<b>{c['family']}</b> as {c['color']}: {c['phases']['Opening (≤12)']}% of losses come by move 12 — you need the first 10 moves of this line, not more ideas.")
+
+    return {
+        "style": style, "style_why": STYLE_WHY[style], "recs": STYLE_RECS[style],
+        "overall": round(overall*100, 1), "games": len(lab),
+        "core_white": core_white, "core_e4": core_e4, "core_d4": core_d4,
+        "keep": keep, "cut": cut, "fix": fix[:4],
+    }
+
+# ── Animated HTML page (pure CSS/JS, no dependencies) ────────────────────────
+_LAB_CSS = """
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0e1117;color:#e8e8f0;font-family:'Source Sans Pro',-apple-system,sans-serif;padding:14px}
+.hero{display:flex;align-items:center;gap:18px;background:linear-gradient(135deg,#141422,#1a1a2e);
+border:1px solid #2a2a44;border-radius:14px;padding:16px 20px;margin-bottom:12px}
+.hero h1{font-size:1.35rem;font-weight:700}
+.hero .sub{color:#8b8ba3;font-size:.82rem;margin-top:2px}
+.stylechip{display:inline-block;margin-top:8px;background:#7c6eff22;color:#b8b0ff;border:1px solid #7c6eff55;
+border-radius:20px;padding:3px 12px;font-size:.75rem}
+.chips{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px}
+.chip{background:#16161f;border:1px solid #26263a;border-radius:10px;padding:10px 14px;animation:cardin .5s ease both}
+.chip-k{font-size:.68rem;text-transform:uppercase;letter-spacing:.06em;color:#8b8ba3}
+.chip-v{font-size:1.05rem;font-weight:700;margin:2px 0}
+.chip-s{font-size:.78rem;color:#4fffb0}
+.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:11px;margin-bottom:14px}
+.card{background:#14141c;border:1px solid #26263a;border-radius:12px;padding:13px 15px;
+animation:cardin .5s ease both;transition:transform .2s,border-color .2s}
+.card:hover{transform:translateY(-3px);border-color:#7c6eff66}
+.card-head{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px}
+.fam{font-weight:700;font-size:.95rem}
+.sub{display:block;color:#8b8ba3;font-size:.74rem;margin-top:2px}
+.grade{font-weight:800;font-size:.9rem;border-radius:8px;padding:2px 10px}
+.card-body{display:flex;align-items:center;gap:14px}
+.gauge{position:relative;width:86px;height:86px;flex-shrink:0}
+.gauge svg{width:86px;height:86px;transform:rotate(-90deg)}
+.ring-bg{fill:none;stroke:#26263a;stroke-width:8}
+.ring-fg{fill:none;stroke-width:8;stroke-linecap:round}
+.ring-val{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+font-weight:800;font-size:1.05rem}
+.ph{flex:1}
+.ph-bar{display:flex;height:10px;border-radius:5px;overflow:hidden;background:#26263a;margin-bottom:4px}
+.ph-lbl{font-size:.7rem;color:#8b8ba3;margin-bottom:8px}
+.verdict{font-size:.78rem;color:#b9b9cc;line-height:1.45;border-top:1px solid #26263a55;padding-top:7px;margin-top:9px}
+.trend{font-size:.72rem;color:#8b8ba3;margin-top:7px}
+.rgrid{display:grid;grid-template-columns:repeat(2,1fr);gap:11px;margin-bottom:12px}
+.rbox{border-radius:12px;padding:12px 14px;animation:cardin .5s ease both}
+.rbox h3{font-size:.72rem;text-transform:uppercase;letter-spacing:.07em;margin-bottom:7px}
+.rbox li{font-size:.8rem;line-height:1.45;margin:5px 0 5px 14px}
+.rbox .mv{color:#4fffb0;font-size:.76rem}
+.rkeep{background:#111f18;border:1px solid #4fffb044}
+.rfix{background:#1f1a12;border:1px solid #ffb45444}
+.rcut{background:#1f1212;border:1px solid #ff5e5e44}
+.radd{background:#15142a;border:1px solid #7c6eff66}
+.steps{background:#16161f;border:1px solid #26263a;border-radius:12px;padding:13px 16px;margin-bottom:12px}
+.steps li{font-size:.84rem;line-height:1.5;margin:6px 0 6px 18px}
+.book{display:flex;align-items:center;gap:16px;background:#111f18;border:1px solid #4fffb033;
+border-radius:12px;padding:12px 16px}
+.bk{flex:1}
+.bk-t{font-size:.78rem;color:#b9b9cc;margin-bottom:5px}
+.bk-bar{height:10px;border-radius:5px;background:#1c1c22;overflow:hidden;margin-bottom:3px}
+.bk-bar>div{height:100%;border-radius:5px}
+.muted{color:#8b8ba3;font-size:.78rem}
+@keyframes cardin{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:translateY(0)}}
+@media(max-width:640px){.grid,.rgrid,.chips{grid-template-columns:1fr}}
+"""
+_LAB_JS = """
+const C=2*Math.PI*34;
+document.querySelectorAll(".ring-fg").forEach(c=>{
+  const pct=Math.max(0,Math.min(100,parseFloat(c.dataset.pct)||0));
+  c.style.strokeDasharray=C;c.style.strokeDashoffset=C;
+  requestAnimationFrame(()=>requestAnimationFrame(()=>{
+    c.style.transition="stroke-dashoffset 1.1s cubic-bezier(.22,.9,.35,1)";
+    c.style.strokeDashoffset=C*(1-pct/100);
+  }));
+});
+document.querySelectorAll(".count").forEach(el=>{
+  const t=parseFloat(el.dataset.target)||0,d=+(el.dataset.dec||0),t0=performance.now();
+  (function tick(now){const p=Math.min(1,(now-t0)/900),e=1-Math.pow(1-p,3);
+   el.textContent=(t*e).toFixed(d);if(p<1)requestAnimationFrame(tick);})(t0);
+});
+document.querySelectorAll(".grow").forEach(el=>{
+  requestAnimationFrame(()=>requestAnimationFrame(()=>{
+    el.style.transition="width 1s ease .2s";el.style.width=el.dataset.w+"%";
+  }));
+});
+"""
+
+def _ring(score):
+    color = "#4fffb0" if score >= 55 else "#7c6eff" if score >= 45 else "#ff5e5e"
+    return (f'<div class="gauge"><svg viewBox="0 0 90 90">'
+            f'<circle class="ring-bg" cx="45" cy="45" r="34"/>'
+            f'<circle class="ring-fg" cx="45" cy="45" r="34" stroke="{color}" data-pct="{score}"/></svg>'
+            f'<div class="ring-val"><span class="count" data-target="{score:.0f}" data-dec="0">0</span>%</div></div>')
+
+def _recipe_page_html(recipe, cards, book_stat):
+    e = _html.escape
+    chips = []
+    for key, label in (("core_white","AS WHITE"),("core_e4","VS 1.e4"),("core_d4","VS 1.d4")):
+        c = recipe[key]
+        v = e(c["label"]) if c else "—"
+        s = f'{c["score"]}% · {c["games"]} games' if c else "not enough games"
+        chips.append(f'<div class="chip"><div class="chip-k">{label}</div>'
+                     f'<div class="chip-v">{v}</div><div class="chip-s">{s}</div></div>')
+    chip_html = '<div class="chips">' + "".join(chips) + '</div>'
+
+    card_html = ""
+    for i, c in enumerate(cards[:8]):
+        gc = GRADE_COLORS[c["grade"]]
+        ph = c["phases"]
+        keys = list(ph.keys())
+        phbar = "".join(
+            f'<div class="grow" data-w="{ph[k]}" style="width:0%;'
+            f'background:{["#ff5e5e","#ffb454","#7c6eff"][j]}"></div>'
+            for j, k in enumerate(keys))
+        trend = "—" if c["trend"] is None else (
+            f'{"▲" if c["trend"]>=3 else "▼" if c["trend"]<=-3 else "▬"} {c["trend"]:+d} pts (recent vs earlier)')
+        star = "*" if c["games"] < 10 else ""
+        card_html += f'''
+<div class="card" style="animation-delay:{i*0.06}s">
+ <div class="card-head">
+  <div><span class="fam">{e(c["family"])}</span>
+   <span class="sub">as {c["color"]} · {c["games"]} games · median {c["median_moves"]} moves</span></div>
+  <span class="grade" style="background:{gc}22;color:{gc};border:1px solid {gc}66">{c["grade"]}{star}</span>
+ </div>
+ <div class="card-body">
+  {_ring(c["score"])}
+  <div class="ph">
+   <div class="ph-lbl">where your {c["losses"]} losses happen</div>
+   <div class="ph-bar">{phbar}</div>
+   <div class="ph-lbl">≤12 · {ph[keys[0]]}% &nbsp; 13–30 · {ph[keys[1]]}% &nbsp; 31+ · {ph[keys[2]]}%</div>
+  </div>
+ </div>
+ <div class="trend">{trend} · leaves theory ~move {c["avg_book"]/2:.0f}</div>
+ <div class="verdict">{e(card_verdict(c))}</div>
+</div>'''
+
+    def box(cls, title, items):
+        body = "".join(f"<li>{it}</li>" for it in items) or '<li class="muted">Nothing here — good news.</li>'
+        return f'<div class="rbox {cls}"><h3>{title}</h3><ul>{body}</ul></div>'
+
+    keep_items = [f'<b>{e(c["family"])}</b> as {c["color"]} — {c["score"]}% over {c["games"]} games' for c in recipe["keep"][:3]]
+    cut_items  = [f'<b>{e(c["family"])}</b> as {c["color"]} — only {c["score"]}% over {c["games"]} games' for c in recipe["cut"][:3]]
+    r = recipe["recs"]
+    add_items = []
+    for slot, pre in (("white","As White"), ("e4","vs 1.e4"), ("d4","vs 1.d4")):
+        name, moves, why = r[slot]
+        add_items.append(f'{pre} → <b>{e(name)}</b><br><span class="mv">{e(moves)}</span><br><span class="muted">{e(why)}</span>')
+
+    keep_box = box("rkeep","KEEP — your proven weapons", keep_items)
+    fix_box  = box("rfix","FIX — where the blood is", recipe["fix"])
+    cut_box  = box("rcut","CUT — stop playing these", cut_items)
+    add_box  = box("radd","ADD — concrete new lines", add_items)
+
+    cw, ce, cd = recipe["core_white"], recipe["core_e4"], recipe["core_d4"]
+    core_line = (f'{e(cw["label"]) if cw else "—"} as White · '
+                 f'{e(ce["label"]) if ce else "—"} vs 1.e4 · '
+                 f'{e(cd["label"]) if cd else "—"} vs 1.d4')
+    steps = f'''<div class="steps"><b>How to use this recipe</b><ol>
+<li>For your next <b>30 games</b>, play only your core lines: {core_line}.</li>
+<li>Fix one bleeding opening from the FIX box — learn its first 10 moves + the trap that keeps killing you.</li>
+<li>Re-scan here after 30 games. The recipe updates itself from your results.</li></ol></div>'''
+
+    bk = book_stat
+    book_html = ""
+    if bk:
+        book_html = f'''<div class="book"><div class="bk">
+<div class="bk-t"><b>Book-club effect:</b> when you\'re still on a known mainline at move 5, you score
+<b>{bk["deep"]}%</b> ({bk["deep_n"]} games) vs <b>{bk["shallow"]}%</b> when you leave theory early ({bk["shallow_n"]} games).</div>
+<div class="bk-bar"><div class="grow" data-w="{bk["deep"]}" style="width:0%;background:#4fffb0"></div></div>
+<div class="bk-bar"><div class="grow" data-w="{bk["shallow"]}" style="width:0%;background:#ff5e5e"></div></div>
+</div></div>'''
+
+    return f'''<!DOCTYPE html><html><head><style>{_LAB_CSS}</style></head><body>
+<div class="hero">
+ <div style="font-size:2.2rem">🎯</div>
+ <div><h1>Your Opening Recipe</h1>
+  <div class="sub">{recipe["games"]} games · overall score <span class="count" data-target="{recipe["overall"]}" data-dec="1">0</span>%</div>
+  <div class="stylechip">Style read: {recipe["style"].replace("_"," ")} — {e(recipe["style_why"])}</div>
+ </div>
+</div>
+{chip_html}
+<div class="grid">{card_html}</div>
+<div class="rgrid">{keep_box}{fix_box}{cut_box}{add_box}</div>
+{steps}
+{book_html}
+<script>{_LAB_JS}</script></body></html>'''
+
+# ── Plotly: repertoire map & danger chart ─────────────────────────────────────
+def _branch(g):
+    if g["color"] == "white": return "As White"
+    return {"e4": "vs 1.e4", "d4": "vs 1.d4"}.get(g["first"], "vs flank/other")
+
+def _sunburst_fig(lab):
+    bg, mg, lg = defaultdict(list), defaultdict(list), defaultdict(list)
+    for g in lab:
+        b = _branch(g)
+        m = f"1.{g['first']}" if g["color"] == "white" else g["family"]
+        l = f"vs {g['family']}" if g["color"] == "white" else (g["variation_raw"] or "—")
+        bg[b].append(g); mg[(b, m)].append(g); lg[(b, m, l)].append(g)
+    merged = defaultdict(list)
+    for k, v in lg.items():
+        (merged[(k[0], k[1], "(rare)")].extend(v) if len(v) < 3 else merged[k].extend(v))
+
+    ids, labels, parents, values, texts = [], [], [], [], []
+    for b, gs in bg.items():
+        ids.append(b); labels.append(b); parents.append(""); values.append(len(gs))
+        texts.append(f"{prate(gs)*100:.0f}% · {len(gs)} games")
+    for (b, m), gs in mg.items():
+        i = f"{b}|{m}"; ids.append(i); labels.append(m); parents.append(b)
+        values.append(len(gs)); texts.append(f"{prate(gs)*100:.0f}% · {len(gs)} games")
+    for (b, m, l), gs in merged.items():
+        i = f"{b}|{m}|{l}"; ids.append(i); labels.append(l); parents.append(f"{b}|{m}")
+        values.append(len(gs)); texts.append(f"{prate(gs)*100:.0f}% · {len(gs)} games")
+
+    color_map = {}
+    for b, gs in bg.items(): color_map[b] = prate(gs)*100
+    for (b, m), gs in mg.items(): color_map[f"{b}|{m}"] = prate(gs)*100
+    for (b, m, l), gs in merged.items(): color_map[f"{b}|{m}|{l}"] = prate(gs)*100
+    colors = [color_map.get(i, 50) for i in ids]
+
+    fig = go.Figure(go.Sunburst(
+        ids=ids, labels=labels, parents=parents, values=values, branchvalues="total",
+        marker=dict(colors=colors, colorscale="RdYlGn", cmin=30, cmax=70,
+                    showscale=True, colorbar=dict(title="score %", thickness=10, len=0.9)),
+        hovertemplate="%{label}<br>%{customdata}<extra></extra>", customdata=texts))
+    fig.update_layout(margin=dict(t=10, l=10, r=10, b=10), height=440)
+    return fig
+
+def _danger_fig(lab, cards):
+    rows = [("Your overall", phase_shares([g for g in lab if g["lost"]]))]
+    for c in cards[:4]:
+        if c["losses"] >= 3:
+            rows.append((f"{c['family']} ({c['color']})", c["phases"]))
+    keys = list(rows[0][1].keys())
+    colors = ["#ff5e5e", "#ffb454", "#7c6eff"]
+    fig = go.Figure()
+    for j, k in enumerate(keys):
+        fig.add_bar(y=[r[0] for r in rows], x=[r[1][k] for r in rows],
+                    orientation="h", name=k, marker_color=colors[j],
+                    text=[f"{r[1][k]}%" for r in rows], textposition="inside")
+    fig.update_layout(barmode="stack", height=60*len(rows)+110,
+                      margin=dict(t=10,l=10,r=10,b=10),
+                      xaxis_title="% of losses", legend=dict(orientation="h", y=-0.18))
+    return fig
+
+# ── Main render ───────────────────────────────────────────────────────────────
+def render_opening_lab(raw_games, username, time_class, tz_label, rated_only):
+    lab = prepare_lab_games(raw_games, username, time_class, tz_label, rated_only)
+    if len(lab) < 10:
+        st.info(f"The Opening Recipe needs at least 10 {time_class} games in this period — "
+                f"play a few more and come back.")
+        return
+
+    cards, overall = family_cards(lab)
+    recipe = build_recipe(lab, cards, overall)
+
+    deep    = [g for g in lab if g["book"] >= 10]
+    shallow = [g for g in lab if g["book"] < 10]
+    book_stat = None
+    if len(deep) >= 5 and len(shallow) >= 5:
+        book_stat = {"deep": round(prate(deep)*100), "deep_n": len(deep),
+                     "shallow": round(prate(shallow)*100), "shallow_n": len(shallow)}
+
+    show = cards if cards else []
+    rows = (len(show[:8]) + 1) // 2
+    height = min(3200, 185 + rows*195 + 400 + 140 + 40)
+    components.html(_recipe_page_html(recipe, show, book_stat), height=height, scrolling=False)
+
+    if len(show) > 8:
+        with st.expander(f"More openings ({len(show)-8} smaller samples)"):
+            for c in show[8:]:
+                gc = GRADE_COLORS[c["grade"]]
+                st.markdown(f"<span style='color:{gc}'>**{c['grade']}**</span> · "
+                            f"**{c['family']}** as {c['color']} — {c['score']}% over {c['games']} games",
+                            unsafe_allow_html=True)
+
+    if HAS_PLOTLY:
+        st.markdown("**Your repertoire map** — size = games played, color = score")
+        st.caption("Click a slice to expand it. '(rare)' = lines you've played fewer than 3 times.")
+        st.plotly_chart(_sunburst_fig(lab), use_container_width=True)
+
+        st.markdown("**Danger zones — where your losses happen**")
+        st.plotly_chart(_danger_fig(lab, cards), use_container_width=True)
+    else:
+        st.info("Install plotly for the interactive repertoire map: `pip install plotly`")
+
+    # ── Zoom mode ──────────────────────────────────────────────────────────────
+    groups = defaultdict(list)
+    for g in lab:
+        groups[(g["color"], g["family"])].append(g)
+    options = [(k, v) for k, v in groups.items() if len(v) >= 8]
+    if options:
+        labels = [f"{fam} · as {color} · {len(v)} games" for (color, fam), v in options]
+        pick = st.selectbox("🔍 Zoom into one opening", labels, key="lab_zoom")
+        if pick is not None:
+            idx = labels.index(pick)
+            (color, fam) = options[idx][0]
+            gsel = groups[(color, fam)]
+
+            monthly = defaultdict(list)
+            for g in gsel: monthly[g["month"]].append(g)
+            months = sorted(m for m in monthly if m)
+            if HAS_PLOTLY and len(months) >= 2:
+                scores = [prate(monthly[m])*100 for m in months]
+                sizes  = [min(24, 7 + len(monthly[m])/1.5) for m in months]
+                fig = go.Figure(go.Scatter(
+                    x=months, y=scores, mode="lines+markers",
+                    line=dict(color="#7c6eff", width=3),
+                    marker=dict(size=sizes, color="#4fffb0", line=dict(width=0)),
+                    hovertemplate="%{x}<br>%{y:.0f}%<extra></extra>"))
+                fig.update_layout(height=300, margin=dict(t=10,l=10,r=10,b=10),
+                                  yaxis_title="score %")
+                st.markdown(f"**{fam} — month by month** (bigger dot = more games)")
+                st.plotly_chart(fig, use_container_width=True)
+
+            ph = phase_shares([g for g in gsel if g["lost"]])
+            st.markdown(f"**{fam}: danger zones** ({sum(1 for g in gsel if g['lost'])} losses)")
+            render_bars([(k, 0, v) for k, v in ph.items()], kind="loss")
+
+            avg_book  = statistics.mean(g["book"] for g in gsel)
+            your_book = statistics.mean(g["book"] for g in lab)
+            st.caption(f"Theory depth here: ~move {avg_book/2:.0f} (your overall average: ~move {your_book/2:.0f})")
+
+            var_groups = defaultdict(list)
+            for g in gsel: var_groups[g["variation_raw"]].append(g)
+            var_rows = [{"Variation": v, "Games": len(gs),
+                         "Score %": round(prate(gs)*100),
+                         "Avg opp delta": round(statistics.mean(
+                             g["opp_rating"] - g["player_rating"] for g in gs))}
+                        for v, gs in var_groups.items() if len(gs) >= 3 and v != "Unknown"]
+            if var_rows:
+                var_rows.sort(key=lambda r: -r["Games"])
+                st.markdown(f"**{fam}: variation breakdown**")
+                st.dataframe(pd.DataFrame(var_rows), hide_index=True, use_container_width=True)
+
+    with st.expander("How the Opening Recipe works"):
+        st.markdown("""
+        - **Families** come from Chess.com's ECO data, with a move-based fallback from the PGN.
+        - **Leaves theory ~move X** compares your first 12 moves against a built-in book of ~90 mainlines.
+        - **Grades** are relative to your own overall score (A = +12 pts or better, F = −12 or worse).
+        - **Danger zones** bucket your losses by game length: ≤12 moves, 13–30, 31+.
+        - **Style read** picks your recommended lines from where your losses cluster.
+        - Nothing here uses an engine — it's your own results, honestly counted (score = wins + ½·draws).
+        """)
+
 # ─── Bar chart helper ─────────────────────────────────────────────────────────
 def render_bars(rows: list, kind: str = "score"):
     """rows = [(label, n, pct)] — pct is absolute, always scaled to 100%."""
@@ -691,7 +1345,10 @@ if len(chart_data) >= 2:
 st.divider()
 
 # ─── Tabs ────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3 = st.tabs(["📌 One Fix This Week", "🕐 Best Time to Play", "🧬 Losing Recipe"])
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📌 One Fix This Week", "🕐 Best Time to Play",
+    "🧬 Losing Recipe", "🎯 Opening Recipe",
+])
 
 # ── Tab 1 ────────────────────────────────────────────────────────────────────
 with tab1:
@@ -781,6 +1438,10 @@ with tab3:
         if lr.get("endgame_note"):
             st.markdown("")
             st.warning(lr["endgame_note"])
+
+# ── Tab 4 — Opening Recipe ────────────────────────────────────────────────────
+with tab4:
+    render_opening_lab(raw_games, username, time_class, tz_label, rated_only)
 
 st.divider()
 
